@@ -6,18 +6,17 @@ from sensor_msgs.msg import LaserScan
 import numpy as np
 import math
 
-class WallSegmentDetector(Node):
+class RobotWallAlignment(Node):
     def __init__(self):
-        super().__init__('wall_segment_detector')
+        super().__init__('robot_wall_alignment')
         
-        # Paramètres de détection
-        self.wall_width = 0.40  # Largeur du mur à détecter (40cm)
-        self.front_angle_range = 40  # Zone de recherche ±30°
-        self.min_points = 5  # Minimum de points pour valider un segment
-        self.max_distance = 3.0  # Distance max de détection (3m)
-        self.linearity_threshold = 0.02  # Seuil d'écart pour la linéarité (2cm)
+        # Paramètres robot
+        self.robot_width = 0.40  # Robot fait 40cm de large
+        self.detection_angle = 30  # Zone de détection ±45°
+        self.min_wall_distance = 0.1  # Distance minimum du mur
+        self.max_wall_distance = 2.0   # Distance maximum de détection
+        self.obstacle_threshold = 0.03  # 3cm d'écart = obstacle
         
-        # Abonnement au topic LaserScan
         self.subscription = self.create_subscription(
             LaserScan,
             '/scan',
@@ -25,212 +24,286 @@ class WallSegmentDetector(Node):
             10
         )
         
-        self.get_logger().info('Détecteur de segment de mur démarré')
-        self.get_logger().info(f'Largeur recherchée: {self.wall_width*100:.0f}cm')
+        self.get_logger().info('Système d\'alignement robot-mur démarré')
+        self.get_logger().info(f'Robot: {self.robot_width*100:.0f}cm de large')
 
     def scan_callback(self, msg):
-        """Callback principal de traitement"""
+        """Traitement principal pour l'alignement"""
         try:
-            # Convertir les données polaires en cartésiennes
-            points = self.polar_to_cartesian(msg)
+            # Obtenir tous les points frontaux
+            points = self.get_front_points(msg)
             
-            if not points:
-                self.get_logger().warn('Aucun point valide détecté')
+            if len(points) < 5:
+                self.get_logger().warning('Pas assez de points pour détecter un mur')
                 return
             
-            # Détecter le segment de mur
-            wall_segment = self.detect_wall_segment(points)
+            # Détecter le mur principal
+            wall_data = self.detect_main_wall(points)
             
-            if wall_segment:
-                self.analyze_wall_segment(wall_segment)
+            if wall_data:
+                self.report_alignment_data(wall_data)
             else:
-                self.get_logger().info('Aucun segment de mur détecté')
+                self.get_logger().warning('Aucun mur détecté à l\'avant')
                 
         except Exception as e:
             self.get_logger().error(f'Erreur: {str(e)}')
 
-    def polar_to_cartesian(self, msg):
-        """Convertit les données LaserScan en points cartésiens"""
+    def get_front_points(self, msg):
+        """Extrait les points dans la zone frontale étendue"""
         points = []
         angle_min = msg.angle_min
         angle_increment = msg.angle_increment
-        
-        # Zone de recherche frontale
         total_points = len(msg.ranges)
-        angle_range_rad = math.radians(self.front_angle_range)
-        index_range = int(angle_range_rad / angle_increment)
         
-        # Points autour de 0° (avant)
+        # Zone de détection étendue
+        detection_rad = math.radians(self.detection_angle)
+        index_range = int(detection_rad / angle_increment)
+        
+        # Points négatifs (fin du tableau)
         start_index = max(0, total_points - index_range)
-        end_index = min(total_points, index_range + 1)
-        
-        # Traiter les points de fin (angles négatifs)
         for i in range(start_index, total_points):
             distance = msg.ranges[i]
             if self.is_valid_distance(distance):
                 angle = angle_min + i * angle_increment
                 x = distance * math.cos(angle)
                 y = distance * math.sin(angle)
-                points.append((x, y, angle, distance))
+                points.append((x, y, angle, distance, i))
         
-        # Traiter les points de début (angles positifs)
-        for i in range(0, end_index):
+        # Points positifs (début du tableau)
+        for i in range(0, index_range + 1):
             distance = msg.ranges[i]
             if self.is_valid_distance(distance):
                 angle = angle_min + i * angle_increment
                 x = distance * math.cos(angle)
                 y = distance * math.sin(angle)
-                points.append((x, y, angle, distance))
+                points.append((x, y, angle, distance, i))
         
-        # Trier par angle pour avoir une séquence continue
-        points.sort(key=lambda p: p[2])  # Trier par angle
+        # Trier par angle
+        points.sort(key=lambda p: p[2])
         return points
 
     def is_valid_distance(self, distance):
-        """Vérifie si une distance est valide"""
-        return (0.1 <= distance <= self.max_distance and 
+        """Vérifie la validité d'une distance"""
+        return (self.min_wall_distance <= distance <= self.max_wall_distance and 
                 not math.isinf(distance) and 
                 not math.isnan(distance))
 
-    def detect_wall_segment(self, points):
-        """Détecte un segment de mur de 40cm"""
-        if len(points) < self.min_points:
+    def detect_main_wall(self, points):
+        """Détecte le mur principal à l'avant du robot"""
+        if len(points) < 3:
             return None
         
-        best_segment = None
-        best_score = float('inf')
+        # Trouver le groupe de points le plus proche de 0°
+        best_segment = self.find_frontal_segment(points)
         
-        # Fenêtre glissante pour trouver le meilleur segment
-        for i in range(len(points) - self.min_points + 1):
-            for j in range(i + self.min_points, len(points) + 1):
-                segment = points[i:j]
-                
-                # Vérifier si la largeur correspond
-                if self.calculate_segment_width(segment) >= self.wall_width * 0.8:  # Tolérance 20%
-                    
-                    # Calculer la linéarité
-                    linearity_score = self.calculate_linearity(segment)
-                    
-                    if linearity_score < best_score and linearity_score < self.linearity_threshold:
-                        best_score = linearity_score
-                        best_segment = segment
+        if not best_segment or len(best_segment) < 3:
+            return None
         
-        return best_segment
+        # Calculer les caractéristiques du mur
+        wall_angle = self.calculate_wall_orientation(best_segment)
+        wall_distance = self.calculate_wall_distance(best_segment)
+        linearity = self.calculate_linearity(best_segment)
+        coverage = self.calculate_robot_coverage(best_segment)
+        
+        return {
+            'segment': best_segment,
+            'angle': wall_angle,
+            'distance': wall_distance,
+            'linearity': linearity,
+            'coverage': coverage
+        }
 
-    def calculate_segment_width(self, segment):
-        """Calcule la largeur physique d'un segment"""
-        if len(segment) < 2:
-            return 0
+    def find_frontal_segment(self, points):
+        """Trouve le segment de mur le plus frontal"""
+        # Grouper les points proches en distance (même mur)
+        groups = []
+        current_group = [points[0]]
         
-        first_point = segment[0]
-        last_point = segment[-1]
+        for i in range(1, len(points)):
+            curr_dist = points[i][3]
+            prev_dist = points[i-1][3]
+            
+            # Si la distance change beaucoup, nouveau groupe
+            if abs(curr_dist - prev_dist) > 0.1:  # 10cm d'écart
+                if len(current_group) >= 3:
+                    groups.append(current_group)
+                current_group = [points[i]]
+            else:
+                current_group.append(points[i])
         
-        # Distance euclidienne entre premier et dernier point
-        dx = last_point[0] - first_point[0]
-        dy = last_point[1] - first_point[1]
-        width = math.sqrt(dx*dx + dy*dy)
+        # Ajouter le dernier groupe
+        if len(current_group) >= 3:
+            groups.append(current_group)
         
-        return width
+        if not groups:
+            return None
+        
+        # Choisir le groupe le plus proche de 0°
+        best_group = None
+        best_centering = float('inf')
+        
+        for group in groups:
+            # Score de centrage (moyenne des angles absolus)
+            centering = sum(abs(p[2]) for p in group) / len(group)
+            if centering < best_centering:
+                best_centering = centering
+                best_group = group
+        
+        return best_group
 
-    def calculate_linearity(self, segment):
-        """Calcule l'écart moyen à la ligne droite (mesure de linéarité)"""
+    def calculate_wall_orientation(self, segment):
+        """Calcule l'angle d'orientation du mur - STABLE avec régression linéaire"""
         if len(segment) < 3:
             return 0
         
-        # Points de début et fin
-        x1, y1 = segment[0][:2]
-        x2, y2 = segment[-1][:2]
+        # Utiliser TOUS les points pour plus de stabilité (régression linéaire)
+        x_coords = [p[0] for p in segment]
+        y_coords = [p[1] for p in segment]
+        n = len(segment)
         
-        # Éviter la division par zéro
-        line_length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
-        if line_length < 0.01:
-            return float('inf')
+        # Calculs de régression linéaire
+        sum_x = sum(x_coords)
+        sum_y = sum(y_coords)
+        sum_xy = sum(x*y for x, y in zip(x_coords, y_coords))
+        sum_x2 = sum(x*x for x in x_coords)
         
-        # Calculer l'écart de chaque point à la ligne droite
+        # Éviter division par zéro
+        denominator = n * sum_x2 - sum_x * sum_x
+        if abs(denominator) < 1e-6:
+            return 0
+        
+        # Pente de la ligne de régression
+        slope = (n * sum_xy - sum_x * sum_y) / denominator
+        
+        # Angle du mur par rapport à l'horizontal
+        wall_angle = math.degrees(math.atan(slope))
+        
+        # Pour un robot qui avance vers un mur:
+        # - Mur horizontal (perpendiculaire au robot) = 0°
+        # - Mur qui monte vers la droite = angle positif
+        # - Mur qui monte vers la gauche = angle négatif
+        
+        # Normaliser entre -90° et +90°
+        while wall_angle > 90:
+            wall_angle -= 180
+        while wall_angle < -90:
+            wall_angle += 180
+    
+        return wall_angle
+
+    def calculate_wall_distance(self, segment):
+        """Calcule la distance du point le plus proche à l'avant du robot"""
+        # Trouver le point le plus proche de l'axe X (avant du robot)
+        min_distance = float('inf')
+        
+        for point in segment:
+            x, y, angle, distance = point[:4]
+            # Distance du point à l'origine (position robot)
+            point_distance = math.sqrt(x*x + y*y)
+            if point_distance < min_distance:
+                min_distance = point_distance
+        
+        return min_distance
+
+    def calculate_linearity(self, segment):
+        """Calcule l'écart moyen pour détecter obstacles"""
+        if len(segment) < 3:
+            return 0
+        
+        x_coords = [p[0] for p in segment]
+        y_coords = [p[1] for p in segment]
+        
+        # Ligne de régression
+        n = len(segment)
+        sum_x = sum(x_coords)
+        sum_y = sum(y_coords)
+        sum_xy = sum(x*y for x, y in zip(x_coords, y_coords))
+        sum_x2 = sum(x*x for x in x_coords)
+        
+        denominator = n * sum_x2 - sum_x * sum_x
+        if abs(denominator) < 1e-10:
+            return 0
+        
+        slope = (n * sum_xy - sum_x * sum_y) / denominator
+        intercept = (sum_y - slope * sum_x) / n
+        
+        # Calculer l'écart de chaque point à la ligne
         total_deviation = 0
-        for point in segment[1:-1]:  # Exclure les points d'extrémité
-            x0, y0 = point[:2]
-            
-            # Distance point-ligne
-            deviation = abs((y2-y1)*x0 - (x2-x1)*y0 + x2*y1 - y2*x1) / line_length
+        for x, y in zip(x_coords, y_coords):
+            expected_y = slope * x + intercept
+            deviation = abs(y - expected_y)
             total_deviation += deviation
         
-        return total_deviation / max(1, len(segment) - 2)
+        return total_deviation / n
 
-    def analyze_wall_segment(self, segment):
-        """Analyse et affiche les caractéristiques du segment de mur"""
-        if not segment:
-            return
+    def calculate_robot_coverage(self, segment):
+        """Calcule quelle portion de la largeur robot est couverte"""
+        if len(segment) < 2:
+            return 0
         
-        # Calculs principaux
-        width = self.calculate_segment_width(segment)
-        linearity = self.calculate_linearity(segment)
+        # Largeur du segment détecté
+        first = segment[0]
+        last = segment[-1]
+        segment_width = math.sqrt((last[0] - first[0])**2 + (last[1] - first[1])**2)
         
-        # Point central du segment
-        mid_index = len(segment) // 2
-        center_point = segment[mid_index]
-        center_x, center_y, center_angle, center_distance = center_point
+        # Pourcentage de couverture
+        coverage = min(1.0, segment_width / self.robot_width)
+        return coverage * 100  # En pourcentage
+
+    def report_alignment_data(self, wall_data):
+        """Affiche les données d'alignement pour le robot"""
+        angle = wall_data['angle']
+        if angle < 0:
+            angle +=90
+        elif angle >= 0:
+            angle -=90
+            
+        distance = wall_data['distance']
+        linearity = wall_data['linearity']
+        coverage = wall_data['coverage']
         
-        # Angle du mur par rapport au LIDAR
-        first_point = segment[0]
-        last_point = segment[-1]
+        print('='*50)
+        print('DONNÉES D\'ALIGNEMENT ROBOT-MUR')
+        print(f'Angle mur:        {angle:+6.2f}° (0° = perpendiculaire)')
+        print(f'Distance proche:  {distance:.3f}m')
+        print(f'Couverture robot: {coverage:.1f}% ({self.robot_width*100:.0f}cm)')
+        print(f'Linéarité:        {linearity*100:.1f}cm')
         
-        wall_vector_x = last_point[0] - first_point[0]
-        wall_vector_y = last_point[1] - first_point[1]
-        wall_angle = math.degrees(math.atan2(wall_vector_y, wall_vector_x))
-        
-        # Normaliser l'angle du mur (-90° à +90°)
-        if wall_angle > 90:
-            wall_angle -= 180
-        elif wall_angle < -90:
-            wall_angle += 180
-        
-        # Affichage des résultats
-        self.get_logger().info('='*60)
-        self.get_logger().info('SEGMENT DE MUR DÉTECTÉ')
-        self.get_logger().info(f'  Points utilisés: {len(segment)}')
-        self.get_logger().info(f'  Largeur mesurée: {width*100:.1f}cm')
-        self.get_logger().info(f'  Distance du centre: {center_distance:.3f}m')
-        self.get_logger().info(f'  Angle du centre: {math.degrees(center_angle):+.1f}°')
-        self.get_logger().info(f'  Orientation du mur: {wall_angle:+.1f}°')
-        self.get_logger().info(f'  Linéarité: {linearity*100:.1f}cm (écart moyen)')
-        
-        # Évaluation de la qualité
-        if linearity < 0.01:
-            quality = "EXCELLENTE"
-        elif linearity < 0.02:
-            quality = "BONNE"
-        elif linearity < 0.03:
-            quality = "CORRECTE"
+        # Instructions d'alignement
+        if abs(angle) < 2:
+            print('✅ ROBOT BIEN ALIGNÉ avec le mur')
+        elif abs(angle) < 5:
+            print(f'🔄 Ajustement mineur: {angle:+.1f}°')
         else:
-            quality = "FAIBLE"
+            print(f'🔄 Correction nécessaire: {angle:+.1f}°')
         
-        self.get_logger().info(f'  Qualité de détection: {quality}')
-        
-        # Informations sur la position
-        if abs(wall_angle) < 5:
-            self.get_logger().info('  → Mur parallèle au LIDAR')
-        elif wall_angle > 0:
-            self.get_logger().info(f'  → Mur incliné vers la DROITE de {abs(90-wall_angle):.1f}°')
+        # Détection d'obstacles
+        if linearity > self.obstacle_threshold:
+            print('⚠️  OBSTACLES détectés sur le trajet')
         else:
-            self.get_logger().info(f'  → Mur incliné vers la GAUCHE de {abs(90+wall_angle):.1f}°')
+            print('✅ Trajet LIBRE vers le mur')
+        
+        # Couverture
+        if coverage < 50:
+            print(f'⚠️  Couverture partielle ({coverage:.1f}% du robot)')
+        else:
+            print(f'✅ Bonne couverture de détection')
+        
+        print(f'Distance sécuritaire: >{self.min_wall_distance*100:.0f}cm')
 
 
 def main(args=None):
-    """Fonction principale"""
     rclpy.init(args=args)
     
     try:
-        detector = WallSegmentDetector()
-        rclpy.spin(detector)
+        aligner = RobotWallAlignment()
+        rclpy.spin(aligner)
         
     except KeyboardInterrupt:
-        print('\nArrêt demandé par l\'utilisateur')
-    except Exception as e:
-        print(f'Erreur: {e}')
+        print('\nArrêt du système d\'alignement')
     finally:
-        if 'detector' in locals():
-            detector.destroy_node()
+        if 'aligner' in locals():
+            aligner.destroy_node()
         rclpy.shutdown()
 
 
