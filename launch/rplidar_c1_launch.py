@@ -12,7 +12,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     channel_type =  LaunchConfiguration('channel_type', default='serial')
-    serial_port = LaunchConfiguration('serial_port', default='/dev/ttyUSB0')
+    serial_port = LaunchConfiguration('serial_port', default="/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_e2c309b2467fef11a8dc241cedd322a4-if00-port0")
     serial_baudrate = LaunchConfiguration('serial_baudrate', default='460800')
     frame_id = LaunchConfiguration('frame_id', default='laser')
     inverted = LaunchConfiguration('inverted', default='false')
